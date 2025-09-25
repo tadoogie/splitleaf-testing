@@ -25,6 +25,7 @@ const highlightId = 'data-highlight';
 let playbackOnLoad = false;
 let currentXmlData = "";
 let volumes = new Map();
+let isPlaying = false; // Track player state for highlighting system
 
 // --- DOMContentLoaded: All event handlers and UI set up here ---
 document.addEventListener("DOMContentLoaded", () => {
@@ -574,11 +575,13 @@ function highlightNotesAtMidiPlaybackTime(ev = false) {
 
     // Unhighlight notes whose off event has occurred
     let ix = timemapIdx;
+    let unhighlightedIds = [];
     while (ix >= 0 && timemap.length > 0) {
         if ('off' in timemap[ix]) {
             let i = currentlyHighlightedNotes.length - 1;
             while (i >= 0) {
                 if (timemap[ix].off.includes(currentlyHighlightedNotes[i].getAttribute(highlightId))) {
+                    unhighlightedIds.push(currentlyHighlightedNotes[i].getAttribute(highlightId));
                     unhighlightNote(currentlyHighlightedNotes[i]);
                     currentlyHighlightedNotes.splice(i, 1);
                 }
@@ -589,6 +592,10 @@ function highlightNotesAtMidiPlaybackTime(ev = false) {
             break;
         }
         ix--;
+    }
+    
+    if (unhighlightedIds.length > 0) {
+        console.log("✅ Unhighlighted notes:", unhighlightedIds);
     }
 
     // At the last onset, schedule future unhighlights for remaining "off" events
@@ -611,10 +618,12 @@ function highlightNotesAtMidiPlaybackTime(ev = false) {
     // Highlight notes at current timemap event
     let closestTimemapTime = timemap[timemapIdx];
     if (closestTimemapTime && 'on' in closestTimemapTime) {
+        let highlightedIds = [];
         for (let id of closestTimemapTime['on']) {
             let note = document.getElementById(id);
             if (note) {
                 highlightNote(note, id);
+                highlightedIds.push(id);
                 // Schedule unhighlight for notes that end later (only if not immediately followed by another "on")
                 for (let i = timemapIdx + 1; i < timemap.length - 1; i++) {
                     if ('off' in timemap[i] && timemap[i].off.includes(id)) {
@@ -626,13 +635,18 @@ function highlightNotesAtMidiPlaybackTime(ev = false) {
                 }
             }
         }
+        if (highlightedIds.length > 0) {
+            console.log("✅ Highlighted notes:", highlightedIds);
+        }
     }
 }
 
 // --- Highlight polling loop (use requestAnimationFrame for best sync) ---
 function midiHighlightLoop() {
     const player = document.getElementById('verovio-midi-player');
-    if (player && !player.paused && !player.ended) {
+    
+    // Check if player is playing using both isPlaying flag and player state
+    if (isPlaying && player && !player.paused && !player.ended) {
         highlightNotesAtMidiPlaybackTime();
 
         // --- PAGE ADVANCE LOGIC (NOTE-BASED) ---
@@ -659,18 +673,42 @@ function midiHighlightLoop() {
 
         highlightRAF = requestAnimationFrame(midiHighlightLoop);
     } else {
+        console.log("🛑 Highlight loop stopped - not playing", {
+            isPlaying,
+            playerExists: !!player,
+            paused: player?.paused,
+            ended: player?.ended
+        });
         highlightRAF = null;
     }
 }
 
 function startMidiHighlighting() {
+    console.log("🎵 Starting MIDI highlighting...", {
+        isPlaying,
+        timemapLength: timemap.length,
+        highlightRAF
+    });
+    
     if (highlightRAF) cancelAnimationFrame(highlightRAF);
     highlightNotesAtMidiPlaybackTime();
-    highlightRAF = requestAnimationFrame(midiHighlightLoop);
+    
+    // Only start the loop if we're actually playing
+    if (isPlaying) {
+        console.log("✅ Starting highlight animation loop");
+        highlightRAF = requestAnimationFrame(midiHighlightLoop);
+    } else {
+        console.log("⏸️ Player not ready - highlight loop will start when playback begins");
+    }
 }
 
 function stopMidiHighlighting() {
+    console.log("🛑 Stopping MIDI highlighting");
     if (highlightRAF) cancelAnimationFrame(highlightRAF);
+    highlightRAF = null;
+    timemapIdx = 0;
+    lastReportedTime = 0;
+    isPlaying = false;
     unHighlightAllElements();
 }
 
@@ -849,6 +887,36 @@ async function loadAudioAndPlayHandler() {
     player.src = 'data:audio/midi;base64,' + base64midi;
     if (typeof player.load === "function") player.load();
     if (typeof player.stop === "function") player.stop();
+    
+    // Add player event listeners to manage isPlaying state
+    player.addEventListener('playing', function(event) {
+        console.log('🎵 MIDI Player playing event:', { tick: event.detail?.tick || 'unknown' });
+        isPlaying = true;
+        
+        // Start the highlighting loop if it's not already running
+        if (!highlightRAF) {
+            console.log('🎯 Starting highlight loop from playing event');
+            highlightRAF = requestAnimationFrame(midiHighlightLoop);
+        }
+    });
+    
+    player.addEventListener('pause', function() {
+        console.log('⏸️ MIDI Player paused');
+        isPlaying = false;
+    });
+    
+    player.addEventListener('ended', function() {
+        console.log('🏁 MIDI Player ended');
+        isPlaying = false;
+        stopMidiHighlighting();
+    });
+    
+    player.addEventListener('stopped', function() {
+        console.log('🛑 MIDI Player stopped');
+        isPlaying = false;
+        stopMidiHighlighting();
+    });
+    
     // Start playbook and highlighting after a short delay (for instrument init)
     setTimeout(async () => {
         console.log('Setting up player volume controls');
