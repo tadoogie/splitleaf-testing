@@ -30,6 +30,10 @@ let volumes = new Map();
 let audioStartTime = 0; // Tone.js audio context start time
 let playbackStartTime = 0; // Wall-clock time when playback started
 
+// --- Debug timing analysis ---
+let timingDebug = false; // Set to true to enable timing debug logs
+let lastDebugTime = 0;
+
 // --- Helper function to get synchronized audio time ---
 function getSynchronizedAudioTime() {
     const player = document.getElementById('verovio-midi-player');
@@ -39,12 +43,70 @@ function getSynchronizedAudioTime() {
     if (audioStartTime > 0 && Tone && Tone.now) {
         const currentAudioTime = Tone.now();
         const elapsedAudioTime = (currentAudioTime - audioStartTime) * 1000; // Convert to ms
+        
+        // Debug timing comparison if enabled
+        if (timingDebug && Date.now() - lastDebugTime > 1000) { // Log once per second
+            const playerTime = (player.currentTime || 0) * 1000;
+            const timeDiff = Math.abs(elapsedAudioTime - playerTime);
+            console.log(`Timing sync - Audio Context: ${elapsedAudioTime.toFixed(2)}ms, Player: ${playerTime.toFixed(2)}ms, Diff: ${timeDiff.toFixed(2)}ms`);
+            lastDebugTime = Date.now();
+        }
+        
         return elapsedAudioTime;
     }
     
     // Fallback to player currentTime
     return (player.currentTime || 0) * 1000;
 }
+
+// --- Enable/disable timing debug ---
+function enableTimingDebug(enable = true) {
+    timingDebug = enable;
+    console.log(`Timing debug ${enable ? 'enabled' : 'disabled'}`);
+}
+
+// --- Handle tempo changes and seeking by detecting large time jumps ---
+function detectTimeJump(currentTime, lastTime) {
+    const timeDiff = Math.abs(currentTime - lastTime);
+    const threshold = 100; // 100ms threshold for detecting jumps
+    
+    if (timeDiff > threshold && lastTime > 0) {
+        if (timingDebug) {
+            console.log(`Time jump detected: ${timeDiff.toFixed(2)}ms`);
+        }
+        return true;
+    }
+    return false;
+}
+
+// --- Reset highlighting state after time jump ---
+function resetHighlightingState() {
+    // Clear all current highlights
+    unHighlightAllElements();
+    
+    // Reset timemap index to find correct position
+    timemapIdx = 0;
+    lastReportedTime = 0;
+    
+    if (timingDebug) {
+        console.log('Highlighting state reset after time jump');
+    }
+}
+
+// --- Expose debugging utilities globally for browser console access ---
+window.midiHighlightDebug = {
+    enableDebug: enableTimingDebug,
+    getSyncTime: getSynchronizedAudioTime,
+    getTimemapInfo: () => ({
+        length: timemap.length,
+        currentIndex: timemapIdx,
+        lastReportedTime: lastReportedTime,
+        audioStartTime: audioStartTime,
+        playbackStartTime: playbackStartTime
+    }),
+    resetState: resetHighlightingState,
+    getCurrentlyHighlighted: () => Array.from(document.querySelectorAll('g.note.currently-playing')).map(n => n.id)
+};
 
 // --- DOMContentLoaded: All event handlers and UI set up here ---
 document.addEventListener("DOMContentLoaded", () => {
@@ -598,8 +660,17 @@ function highlightNotesAtMidiPlaybackTime(ev = false) {
         return;
     }
     
+    // Detect time jumps (seeking, tempo changes) and reset state if needed
+    if (detectTimeJump(t, lastReportedTime)) {
+        resetHighlightingState();
+    }
+    
     const currentlyHighlightedNotes = Array.from(document.querySelectorAll('g.note.currently-playing'));
     const firstNoteOnPage = document.querySelector('.note');
+
+    // Add small lookahead for smoother highlighting (16ms ≈ one frame at 60fps)
+    const lookaheadTime = 16;
+    const tWithLookahead = t + lookaheadTime;
 
     // Efficiently advance timemapIdx with better bounds checking
     if (t < lastReportedTime) timemapIdx = 0;
@@ -608,7 +679,7 @@ function highlightNotesAtMidiPlaybackTime(ev = false) {
         timemapIdx < timemap.length - 1 &&
         timemap[timemapIdx] &&
         timemap[timemapIdx].tstamp !== undefined &&
-        Math.round(timemap[timemapIdx].tstamp) + 1 < Math.round(t)
+        Math.round(timemap[timemapIdx].tstamp) + 1 < Math.round(tWithLookahead)
     ) {
         timemapIdx++;
     }
@@ -616,7 +687,7 @@ function highlightNotesAtMidiPlaybackTime(ev = false) {
     // Unhighlight notes whose off event has occurred
     let ix = timemapIdx;
     while (ix >= 0 && timemap.length > 0) {
-        if (timemap[ix] && 'off' in timemap[ix]) {
+        if (timemap[ix] && 'off' in timemap[ix] && timemap[ix].tstamp <= t) {
             let i = currentlyHighlightedNotes.length - 1;
             while (i >= 0) {
                 if (timemap[ix].off.includes(currentlyHighlightedNotes[i].getAttribute(highlightId))) {
@@ -656,12 +727,12 @@ function highlightNotesAtMidiPlaybackTime(ev = false) {
         }
     }
 
-    // Highlight notes at current timemap event
+    // Highlight notes at current timemap event (using lookahead)
     let closestTimemapTime = timemap[timemapIdx];
-    if (closestTimemapTime && 'on' in closestTimemapTime) {
+    if (closestTimemapTime && 'on' in closestTimemapTime && closestTimemapTime.tstamp <= tWithLookahead) {
         for (let id of closestTimemapTime['on']) {
             let note = document.getElementById(id);
-            if (note) {
+            if (note && !note.classList.contains('currently-playing')) {
                 highlightNote(note, id);
                 // Schedule unhighlight for notes that end later (only if not immediately followed by another "on")
                 for (let i = timemapIdx + 1; i < timemap.length - 1; i++) {
